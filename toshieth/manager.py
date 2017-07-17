@@ -193,6 +193,9 @@ class TransactionQueueHandler(DatabaseMixin, RedisMixin, EthereumMixin, BalanceM
                         addresses_to_check.add(transaction['to_address'])
                         continue
                     else:
+                        if any(t['blocknumber'] is not None and t['blocknumber'] > last_blocknumber for t in transactions_in):
+                            addresses_to_check.add(ethereum_address)
+
                         # there's no reason to continue on here since all the
                         # following transaction in the queue cannot be processed
                         # until this one is

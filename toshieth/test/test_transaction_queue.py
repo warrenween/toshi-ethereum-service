@@ -1,10 +1,12 @@
 import asyncio
+import os
 from tornado.escape import json_decode
 from tornado.testing import gen_test
 
 from toshieth.test.base import EthServiceBaseTest, requires_full_stack
 from toshi.test.ethereum.parity import FAUCET_PRIVATE_KEY, FAUCET_ADDRESS
-from toshi.ethereum.utils import data_decoder
+from toshi.test.ethereum.faucet import FaucetMixin
+from toshi.ethereum.utils import data_decoder, data_encoder, private_key_to_address
 from toshi.ethereum.tx import sign_transaction, DEFAULT_STARTGAS, DEFAULT_GASPRICE
 from toshi.utils import parse_int
 from toshi.jsonrpc.client import JsonRPCClient
@@ -370,3 +372,54 @@ class TransactionQueueTest(EthServiceBaseTest):
             await asyncio.sleep(3)
 
         await self.ensure_confirmed(*txs)
+
+class LargeVolumeTest(FaucetMixin, EthServiceBaseTest):
+
+    @gen_test(timeout=300)
+    @requires_full_stack
+    async def test_large_volume_of_txs(self):
+        """Tests that the service can handle a large volume of transactions
+        from different users
+        """
+
+        num_of_txs = 10
+        # create sending user keys
+        from_keys = [os.urandom(32) for _ in range(num_of_txs)]
+        # create receiver user addresses
+        to_addresses = [data_encoder(os.urandom(20)) for _ in range(num_of_txs)]
+        # faucet sending users
+        txs = []
+        for key in from_keys:
+            addr = private_key_to_address(key)
+            txs.append((await self.send_tx(FAUCET_PRIVATE_KEY, addr, 10 * (10 ** 18))))
+        # send transactions
+        import concurrent.futures
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+            futures = [loop.run_in_executor(executor, self.send_tx, key, address, 10 ** 18) for key, address in zip(from_keys, to_addresses)]
+            for future in concurrent.futures.as_completed(futures):
+                tx = future.result()
+                txs.append(tx)
+        # wait for completion of all
+        # async with self.pool.acquire() as con:
+        #     rows = await con.fetch("SELECT * FROM transactions")
+        # for row in rows:
+        #     if row['hash'] not in txs:
+        #         print("NOT IN TXS")
+        #     print(row)
+        while True:
+            async with self.pool.acquire() as con:
+                rows = await con.fetch("SELECT status, COUNT(*) FROM transactions WHERE hash = ANY($1) GROUP BY status",
+                                       txs)
+            s = []
+            for row in rows:
+                s.append("{}: {}".format(row['status'], row['count']))
+                if row['status'] == 'confirmed' and row['count'] == len(txs):
+                    return
+                if row['status'] == 'queued' and row['count'] == 1:
+                    async with self.pool.acquire() as con:
+                        row = await con.fetchrow("SELECT * FROM transactions WHERE status = 'queued'")
+                    print(row)
+
+            print(', '.join(s))
+            await asyncio.sleep(1)
